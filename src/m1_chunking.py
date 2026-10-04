@@ -9,8 +9,12 @@ So sánh với basic chunking (baseline) để thấy improvement.
 Test: pytest tests/test_m1.py
 """
 
-import os, sys, glob, re
+import glob
+import os
+import re
+import sys
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -18,8 +22,12 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import (DATA_DIR, HIERARCHICAL_PARENT_SIZE, HIERARCHICAL_CHILD_SIZE,
-                    SEMANTIC_THRESHOLD)
+from config import (
+    DATA_DIR,
+    HIERARCHICAL_CHILD_SIZE,
+    HIERARCHICAL_PARENT_SIZE,
+    SEMANTIC_THRESHOLD,
+)
 
 
 @dataclass
@@ -92,20 +100,88 @@ def chunk_semantic(text: str, threshold: float = SEMANTIC_THRESHOLD,
     Split text by sentence similarity — nhóm câu cùng chủ đề.
     Tốt hơn basic vì không cắt giữa ý.
     """
-    # TODO: Implement semantic chunking
-    # 1. from sentence_transformers import SentenceTransformer
-    #    from numpy import dot
-    #    from numpy.linalg import norm
-    # 2. metadata = metadata or {}
-    # 3. Split text thành sentences: re.split(r'(?<=[.!?])\s+|\n\n', text)
-    # 4. model = SentenceTransformer("all-MiniLM-L6-v2")
-    #    embeddings = model.encode(sentences)
-    # 5. cosine_sim(a, b) = dot(a, b) / (norm(a) * norm(b) + 1e-9)
-    # 6. Duyệt từ sentence[1]:
-    #      - sim(embedding[i-1], embedding[i]) < threshold → tách chunk mới
-    #      - else: gộp vào chunk hiện tại
-    # 7. Return [Chunk(text=joined_group, metadata={..., "strategy": "semantic"})]
-    return []
+    from numpy import dot
+    from numpy.linalg import norm
+
+    metadata = metadata or {}
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+|\n\s*\n", text)
+        if sentence.strip()
+    ]
+    if not sentences:
+        return []
+
+    model = _get_sentence_transformer()
+    embeddings = model.encode(sentences)
+
+    groups: list[list[str]] = [[sentences[0]]]
+    for index in range(1, len(sentences)):
+        previous = embeddings[index - 1]
+        current = embeddings[index]
+        similarity = float(dot(previous, current) / (norm(previous) * norm(current) + 1e-9))
+        if similarity < threshold:
+            groups.append([sentences[index]])
+        else:
+            groups[-1].append(sentences[index])
+
+    return [
+        Chunk(
+            text=" ".join(group),
+            metadata={**metadata, "strategy": "semantic", "chunk_index": index},
+        )
+        for index, group in enumerate(groups)
+    ]
+
+
+@lru_cache(maxsize=1)
+def _get_sentence_transformer():
+    """Load the embedding model once instead of once per document."""
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+
+def _split_oversized_block(block: str, max_size: int) -> list[str]:
+    """Split a block on sentence/word boundaries, falling back to hard cuts."""
+    if len(block) <= max_size:
+        return [block]
+
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", block) if part.strip()]
+    if len(sentences) > 1:
+        return _pack_blocks(sentences, max_size, " ")
+
+    words = block.split()
+    if len(words) > 1:
+        return _pack_blocks(words, max_size, " ")
+
+    return [block[start:start + max_size] for start in range(0, len(block), max_size)]
+
+
+def _pack_blocks(blocks: list[str], max_size: int, separator: str = "\n\n") -> list[str]:
+    """Pack text blocks up to max_size while preserving natural boundaries."""
+    if max_size <= 0:
+        raise ValueError("chunk size must be greater than zero")
+
+    normalized: list[str] = []
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        normalized.extend(_split_oversized_block(block, max_size))
+
+    packed: list[str] = []
+    current = ""
+    for block in normalized:
+        candidate = f"{current}{separator}{block}" if current else block
+        if current and len(candidate) > max_size:
+            packed.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        packed.append(current)
+    return packed
 
 
 # ─── Strategy 2: Hierarchical Chunking ──────────────────
@@ -121,16 +197,48 @@ def chunk_hierarchical(text: str, parent_size: int = HIERARCHICAL_PARENT_SIZE,
     Returns:
         (parents, children) — mỗi child có parent_id link đến parent.
     """
-    # TODO: Implement hierarchical chunking
-    # 1. metadata = metadata or {}
-    # 2. Split text bằng "\n\n" → paragraphs
-    # 3. Gộp paragraphs thành parent chunks (mỗi parent ≤ parent_size chars):
-    #      pid = f"parent_{len(parents)}"
-    #      parents.append(Chunk(text=..., metadata={..., "chunk_type": "parent", "parent_id": pid}))
-    # 4. Mỗi parent → split thành children (mỗi child ≤ child_size chars):
-    #      children.append(Chunk(text=..., metadata={..., "chunk_type": "child"}, parent_id=pid))
-    # 5. return (parents, children)
-    return ([], [])
+    metadata = metadata or {}
+    if parent_size <= 0 or child_size <= 0:
+        raise ValueError("parent_size and child_size must be greater than zero")
+
+    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
+    parent_texts = _pack_blocks(paragraphs, parent_size)
+    parents: list[Chunk] = []
+    children: list[Chunk] = []
+
+    for parent_index, parent_text in enumerate(parent_texts):
+        parent_id = f"parent_{parent_index}"
+        parents.append(
+            Chunk(
+                text=parent_text,
+                metadata={
+                    **metadata,
+                    "chunk_type": "parent",
+                    "parent_id": parent_id,
+                    "chunk_index": parent_index,
+                },
+            )
+        )
+
+        child_blocks = [
+            block.strip()
+            for block in re.split(r"(?<=[.!?])\s+|\n\s*\n", parent_text)
+            if block.strip()
+        ]
+        for child_text in _pack_blocks(child_blocks, child_size, " "):
+            children.append(
+                Chunk(
+                    text=child_text,
+                    metadata={
+                        **metadata,
+                        "chunk_type": "child",
+                        "chunk_index": len(children),
+                    },
+                    parent_id=parent_id,
+                )
+            )
+
+    return parents, children
 
 
 # ─── Strategy 3: Structure-Aware Chunking ────────────────
@@ -141,14 +249,37 @@ def chunk_structure_aware(text: str, metadata: dict | None = None) -> list[Chunk
     Parse markdown headers → chunk theo logical structure.
     Giữ nguyên tables, code blocks, lists — không cắt giữa chừng.
     """
-    # TODO: Implement structure-aware chunking
-    # 1. metadata = metadata or {}
-    # 2. sections = re.split(r'(^#{1,3}\s+.+$)', text, flags=re.MULTILINE)
-    # 3. Duyệt sections:
-    #      - Nếu match header (^#{1,3}\s+): lưu header hiện tại, tạo chunk cho content trước đó
-    #      - Else: gộp vào content hiện tại
-    # 4. Return [Chunk(text=header+content, metadata={..., "section": header, "strategy": "structure"})]
-    return []
+    metadata = metadata or {}
+    header_pattern = re.compile(r"^#{1,3}\s+.+$", flags=re.MULTILINE)
+    matches = list(header_pattern.finditer(text))
+    chunks: list[Chunk] = []
+
+    def add_chunk(chunk_text: str, section: str) -> None:
+        chunk_text = chunk_text.strip()
+        if chunk_text:
+            chunks.append(
+                Chunk(
+                    text=chunk_text,
+                    metadata={
+                        **metadata,
+                        "section": section,
+                        "strategy": "structure",
+                        "chunk_index": len(chunks),
+                    },
+                )
+            )
+
+    if not matches:
+        add_chunk(text, "")
+        return chunks
+
+    add_chunk(text[:matches[0].start()], "")
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        header = match.group().strip()
+        add_chunk(text[match.start():end], header)
+
+    return chunks
 
 
 # ─── A/B Test: Compare All Strategies ────────────────────
